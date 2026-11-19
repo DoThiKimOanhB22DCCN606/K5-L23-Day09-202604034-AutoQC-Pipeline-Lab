@@ -35,10 +35,99 @@ Gợi ý
 - `iou_xywh` có sẵn. Dòng nhãn hỏng không được làm script chết (dùng `ds.valid_boxes` và `parse_yolo_line` trong try).
 - Kết quả phụ thuộc mạnh vào ngưỡng: calibrate chúng ở Bước 3 thay vì đoán.
 """
-from ..common import WARN, Issue, iou_xywh, parse_yolo_line  # noqa: F401
-from ..model_cache import get_preds  # noqa: F401
+from ..common import WARN, Issue, iou_xywh, parse_yolo_line
+from ..model_cache import get_preds
 
 
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+
+    settings = cfg["second_opinion"]
+    issues = []
+
+    for image_path in ds.image_files():
+        stem = image_path.stem
+        label_path = ds.label_path(stem)
+        if not label_path.exists() or stem not in preds:
+            continue
+
+        image_size = ds.image_size(stem)
+        if image_size is None:
+            selected_preds = []
+        else:
+            image_width, image_height = image_size
+            selected_preds = [
+                (int(row[0]), float(row[1]), tuple(float(v) for v in row[2:6]))
+                for row in preds[stem]
+                if float(row[1]) >= settings["conf"]
+                and float(row[4]) * image_width * float(row[5]) * image_height >= settings["min_area_px"]
+            ]
+
+        fp_preds = [
+            (int(row[0]), float(row[1]), tuple(float(v) for v in row[2:6]))
+            for row in preds[stem]
+            if float(row[1]) >= settings["fp_conf"]
+        ]
+
+        labels = []
+        for line_no, text in ds.read_label_lines(stem) or []:
+            try:
+                cls, cx, cy, width, height = parse_yolo_line(text)
+            except ValueError:
+                continue
+            if 0 <= cls < len(ds.classes):
+                labels.append((line_no, cls, (cx, cy, width, height)))
+
+        for pred_cls, confidence, pred_box in selected_preds:
+            overlaps = [
+                (label_cls, iou_xywh(pred_box, label_box))
+                for _, label_cls, label_box in labels
+            ]
+            candidates = [
+                (label_cls, overlap)
+                for label_cls, overlap in overlaps
+                if overlap >= settings["iou_missing"]
+            ]
+
+            if not candidates:
+                issues.append(Issue(
+                    "second_opinion", WARN, "POSSIBLE_MISSING", stem,
+                    "model thấy vật nhưng không có box nhãn tương ứng",
+                    extra={"conf": confidence},
+                ))
+                continue
+
+            same_class = [overlap for label_cls, overlap in candidates if label_cls == pred_cls]
+            if same_class:
+                best_iou = max(same_class)
+                if best_iou < settings["iou_loose"]:
+                    issues.append(Issue(
+                        "second_opinion", WARN, "POSSIBLE_LOOSE_BOX", stem,
+                        f"box nhãn cùng lớp có IoU thấp ({best_iou:.3f})",
+                        extra={"conf": confidence, "iou": best_iou},
+                    ))
+                continue
+
+            other_class = [overlap for label_cls, overlap in candidates if label_cls != pred_cls]
+            if other_class and max(other_class) >= settings["iou_match"]:
+                best_iou = max(other_class)
+                issues.append(Issue(
+                    "second_opinion", WARN, "POSSIBLE_WRONG_CLASS", stem,
+                    "model và nhãn có thể gán khác lớp cho cùng vật",
+                    extra={"conf": confidence, "iou": best_iou},
+                ))
+
+        for line_no, label_cls, label_box in labels:
+            best_iou = max(
+                (iou_xywh(label_box, pred_box) for _, _, pred_box in fp_preds),
+                default=0.0,
+            )
+            if best_iou < settings["iou_missing"]:
+                issues.append(Issue(
+                    "second_opinion", WARN, "POSSIBLE_FALSE_POS", stem,
+                    f"box nhãn lớp {label_cls} không khớp dự đoán nào của model",
+                    line_no, extra={"iou": best_iou},
+                ))
+
+    return issues
